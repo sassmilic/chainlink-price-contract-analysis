@@ -1,5 +1,8 @@
+import bisect
 import glob
 import json
+import math
+import os
 import pandas as pd
 import re
 import requests
@@ -223,43 +226,158 @@ def get_all_entries(event, first_block, last_block=None, chunk_size=500, query=N
     print('Done.')
     return result
 
-def get_prices(from_ts, to_ts, fsym='ETH', tsym='USD', limit=2000):
-    print('Querying dates {} to {}.'.format(
-        convert_unixtime(from_ts),
-        convert_unixtime(to_ts)
-    ))
-    # NOTE: they don't allow queries for prices older than a week
-    res = {
-        'time': [],
-        'high': [],
-        'low': [],
-        'open': [],
-        'close': [],
-        'volumefrom': [],
-        'volumeto': []
-    }
-    r = requests.get(CRYPTO_COMPARE_API_URL.format(
-        fsym=fsym, tsym=tsym, to_ts=to_ts, limit=limit), headers=CRYPTO_COMPARE_API_HEADER)
+def load_all_price_data(from_ts, to_ts):
+    # check if data is already saved
+    if not glob.glob('ETH-USD_prices*'):
+        return get_prices(from_ts, to_ts)
     
-    d = json.loads(r.content.decode('utf-8'))
-    
-    if d.get('Response') == 'Error':
-        print(d['Message'])
-        return pd.DataFrame(res)
+    ints, df_saved = load_saved_price_data()
+    df_saved = df_saved[(from_ts <= df_saved.time) & (df_saved.time <= to_ts)]
 
-    for x in d['Data']['Data']:
-        if x['time'] < from_ts:
-            break
-        for k in res.keys():
-            res[k].append(x[k])
-    else:
-        # need to keep querying to get all data in range
-        df = get_prices(from_ts, min(res['time']) - 1)
-        df_ = pd.concat([pd.DataFrame(res), df])
-        df_.reset_index(inplace=True, drop=True)
-        return df_
+    # intervals `ints` do not overlap and are sorted
+    # find uncomputed timeframe between intervals
+    df = pd.DataFrame()
+
+    # gather data even further back, if possible
+    if from_ts < ints[0][0]:
+        df = get_prices(from_ts, ints[0][0])
+
+    for i in range(len(ints) - 1):
+        from_, to_ = ints[i][1] + 1, ints[i+1][0] - 1
+        df_ =  get_prices(from_, to_)
+        df = pd.concat([df, df_])
+
+    # new data
+    from_, to_ = ints[-1][1] + 1, int(time.time())
+    df_ =  get_prices(from_, to_)
+    df = pd.concat([df, df_])
+
+    # concat new data with old data
+    df = pd.concat([df_saved, df])
+    df.sort_values(by=['time'], inplace=True)
+    df.reset_index(inplace=True, drop=True)
+    return df
+
+def load_saved_price_data():
+    # example file name:
+    # ETH-USD_prices_1587033516_1587724716.csv
+    df_final = pd.DataFrame()
+    ts_ints = []
+    patt = 'ETH-USD_prices_(\d+)_(\d+).csv'
+    # file name to ts interval
+    files = {}
+    for fname in glob.glob('ETH-USD_prices_*'):
+        m = re.match(patt, fname)
+        from_ts = int(m.group(1))
+        to_ts = int(m.group(2))
+        files[fname] = (from_ts, to_ts)
+    # we don't want duplicate data;
+    # i.e. we don't want the timestamp
+    # intervals to overlap
+    ts_ints = merge_intervals(list(files.values()))
+    # for each file, only load relevant subset
+    # that aligns with merged intervals
+    start, end = zip(*ts_ints)
+    for fname, (from_ts, to_ts) in files.items():
+        i = bisect.bisect(start, from_ts) - 1
+        target_from, target_to = ts_ints[i]
+        df = pd.read_csv(fname)
+        df = df[(target_from <= df['time']) & (df['time'] <= min(target_to, to_ts))]
+        df_final = pd.concat([df_final, df])
+        if 'Unnamed: 0' in df_final.columns:
+            df_final.drop(columns=['Unnamed: 0'], inplace=True)
+            df_final.sort_values(by=['time'], inplace=True)
+            df_final.reset_index(inplace=True, drop=True)
+    print('Loaded data for the following time ranges:')
+    print(ts_ints)
+    return ts_ints, df_final
+
+def clean_up_price_files():
+    # clean up duplicate data
+    old_files = glob.glob('ETH-USD_prices_*')
+    if len(old_files) <= 1:
+        print('No files removed.')
+        return
+    ts_ints, df = load_saved_price_data()
+    for from_ts, to_ts in ts_ints:
+        df_ = df[(from_ts <= df.time) & (df.time <= to_ts)]
+        filename = 'ETH-USD_prices_{}_{}.csv'.format(int(from_ts), int(to_ts))
+        df_.to_csv(filename)
+        print('Created new file: ', filename)
+    #delete old files
+    for fname in old_files:
+        os.remove(fname)
+        print('Removed:', fname)
+
+def merge_intervals(arr):
+    # a leetcode problem!
+    arr.sort(key=lambda x: x[0])
+    # array to hold the merged intervals
+    merged = []
+    s = None
+    max_ = -math.inf
+    for i in range(len(arr)):
+        t = arr[i]
+        if t[0] > max_ + 1:
+            if i != 0:
+                merged.append([s, max_])
+            max_ = t[1]
+            s = t[0]
+        else:
+            if t[1] > max_ + 1:
+                max_ = t[1]
+
+    if max_ != math.inf and [s, max_] not in merged:
+        merged.append([s, max_])
+    
+    return merged
+
+def get_prices(from_ts, to_ts, fsym='ETH', tsym='USD', limit=2000, save=True):
+
+    def _get_prices(from_ts, to_ts, fsym, tsym, limit):
+        print('Querying dates {} to {}.'.format(
+            convert_unixtime(from_ts),
+            convert_unixtime(to_ts)
+        ))
+        # NOTE: they don't allow queries for prices older than a week
+        res = {
+            'time': [],
+            'high': [],
+            'low': [],
+            'open': [],
+            'close': [],
+            'volumefrom': [],
+            'volumeto': []
+        }
+        r = requests.get(CRYPTO_COMPARE_API_URL.format(
+            fsym=fsym, tsym=tsym, to_ts=to_ts, limit=limit), headers=CRYPTO_COMPARE_API_HEADER)
         
-    return pd.DataFrame(res)
+        d = json.loads(r.content.decode('utf-8'))
+        
+        if d.get('Response') == 'Error':
+            print(d['Message'])
+            return pd.DataFrame(res)
+
+        for x in d['Data']['Data']:
+            if x['time'] < from_ts:
+                break
+            for k in res.keys():
+                res[k].append(x[k])
+        else:
+            # need to keep querying to get all data in range
+            df_ = _get_prices(from_ts, min(res['time']) - 1, fsym, tsym, limit)
+            df = pd.concat([pd.DataFrame(res), df_])
+            df.reset_index(inplace=True, drop=True)
+            return df
+        return pd.DataFrame(res)
+       
+    df = _get_prices(from_ts, to_ts, fsym, tsym, limit)
+    if df.empty:
+        print('No new prices gathered.')
+    if save:
+        df.to_csv('ETH-USD_prices_{}_{}.csv'.format(int(from_ts), int(to_ts)))
+
+    return df
 
 
 if __name__ == "__main__":
@@ -283,17 +401,18 @@ if __name__ == "__main__":
         chunk_size=500
     )
     #print(res)
-    '''
     #res = load_all_price_response_data()
     #print(res)
+    
     ts = int(time.time())
     from_ts = ts - 60*60*24*8
     to_ts = ts
 
     df = get_prices(from_ts, to_ts)
-
-    df.to_csv('ETH-USD_prices_{}_{}.csv'.format(
-        convert_unixtime(from_ts),
-        convert_unixtime(to_ts))
-    )
-
+    to_ts = int(time.time())
+    # seconds in minute, minutes in hour, hours in day, num days
+    from_ts = to_ts - 60*60*24*14
+    df = load_all_price_data(from_ts, to_ts)
+    print(df)
+    '''
+    clean_up_price_files()
