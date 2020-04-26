@@ -7,7 +7,8 @@ import pandas as pd
 import re
 import requests
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
+from tinydb import TinyDB, Query, where
 from tqdm import tqdm
 # disable locks due to random deadlocks
 tqdm.get_lock().locks = []
@@ -27,96 +28,117 @@ convert_unixtime = lambda ts: datetime.utcfromtimestamp(ts).strftime('%Y-%m-%d %
 filename = lambda rnd, other_info: 'eth_usd_price_round_' + '{}_{}.csv'.format(rnd, other_info)
 FILE_PREFIX = 'eth_usd_price_round'
 
+### LOAD TINY DATABASE ###
+
+DB = TinyDB('db.json')
+
+# database tables
+ORACLE_RESPONSE_TABLE = 'oracle_responses'
+ETH_USD_PRICE_TABLE = 'eth-usd-prices'
+
 def connect():
     web3 = Web3(Web3.WebsocketProvider(INFURA_PROVIDER))
     contract = web3.eth.contract(ETH_USD_PRICE_CONTRACT_ADDR, abi=CHAINLINK_ABI)
     return web3, contract
 
+def tinydb_table_to_dataframe(table):
+    d = {}
+    for i,row in enumerate(table):
+        if i == 0:
+            d = {k: [] for k in row.keys()}
+        for k in d.keys():
+            d[k].append(row[k])
+    return pd.DataFrame(d)
+
+def dataframe_to_tinydb_rows(df):
+    d = df.to_dict()
+    return [{k: d[k][i] for k in d.keys()} for i in range(df.shape[0])]
+
 def load_all_price_response_data():
+    # assumes table 'oracle_responses' in `DB` in not empty
     web3, contract = connect()
     
-    # check if data is already saved
+    table = DB.table(ORACLE_RESPONSE_TABLE)
+   
+    # check if data is already up-to-date
     latest_round = contract.functions.latestRound().call()
     print('Latest round: {}'.format(latest_round))
+  
+    last_round = max(row['answer_id'] for row in table)
+    print('Last saved round: {}.'.format(last_round))
+    if last_round == latest_round:
+        # return dataframe
+        return tinydb_table_to_dataframe(table)
+
+    first_block = approx_earliest_eth_block(last_round + 1)['number']
+    entries = get_all_entries(
+        contract.events.ResponseReceived(),
+        first_block,
+        query=(
+            ('args', 'response'),
+            ('args', 'answerId'),
+            ('args', 'sender'),
+            ('blockNumber',)
+        ),
+        chunk_size=500
+    )
     
-    files = glob.glob('{}*'.format(FILE_PREFIX))
-    if files:
-        patt = filename('(\d+)', 'price_responses')
-        latest_file = max(files, key=lambda fname: int(re.match(patt, fname).group(1)))
-        df_old = pd.read_csv(latest_file)
-        if 'Unnamed: 0' in df_old.columns:
-            df_old = df_old.drop(columns=['Unnamed: 0'])
-    
-    # check if saved data is up-to-date
-    up_to_date = True
-    if files:
-        last_round = int(re.match(patt, latest_file).group(1))
-        if latest_round != last_round:
-            up_to_date = False
-    else:
-        last_round = 0
-        up_to_date = False
+    df = pd.DataFrame(entries)
+    df.rename(columns={
+        'response': 'price',
+        'answerId': 'answer_id',
+        'sender': 'oracle'}
+    )
+    rows = dataframe_to_tinydb_rows(df)
+    print('Inserting new rows...')
+    table.insert_multiple(rows)
 
-    # if not, update data
-    if up_to_date:
-        df = df_old
-    else:
-        first_block = approx_earliest_eth_block(last_round + 1)['number']
-        entries = get_all_entries(
-            contract.events.ResponseReceived(),
-            first_block,
-            query=(
-                ('args', 'response'),
-                ('args', 'answerId'),
-                ('args', 'sender'),
-                ('blockNumber',)
-            ),
-            chunk_size=500
-        )
-        df = _augment_price_response_data(entries)
+    _augment_price_response_data(table)
 
-    # concat with previous data
-    if files and not up_to_date:
-        df_answers = pd.concat([df_old, df])
-    else:
-        df_answers = df
+    rows = dataframe_to_tinydb_rows(df)
+    table.insert_multiple(rows)
 
-    # just in case
-    df_answers.sort_values(by=['answer_id'], inplace=True)
-    df_answers.drop_duplicates(inplace=True)
-    df_answers.reset_index(drop=True, inplace=True)
-    # remove entries with answer_id <= last_round
-    df = df[df.answer_id > last_round]
+    return tinydb_table_to_dataframe(table)
 
-    # save
-    df_answers.to_csv(filename(str(latest_round), 'price_responses'))
-    print('Done.')
-    return df_answers
-
-def _augment_price_response_data(entries):
+def _augment_price_response_data(table):
 
     web3, contract = connect()
 
-    print('Augmenting dataframe...')
-    df = pd.DataFrame(entries)
-    df = df.rename(columns={'response': 'price', 'answerId': 'answer_id', 'sender': 'oracle'})
+    print('Augmenting entries...')
 
-    # add timestamps
-    # beware of potential disconnection
+    def _add_timestamps():
+        def transform(row):
+            pbar.update(1)
+            ts =  web3.eth.getBlock(row['blockNumber'])['timestamp']
+            row['timestamp'] = ts
+        return transform
+
+    def _add_human_readable_date():
+        def transform(row):
+            row['date'] = convert_unixtime(row['timestamp'])
+        return transform
+
+    def _add_price_float():
+        def transform(row):
+            row['price_float'] = row['price'] / 1e8
+        return transform
+
+    Response = Query()
+
     print('Adding timestamps...')
-    tss = []
-    for bnum in tqdm(df['blockNumber']):
-        ts = web3.eth.getBlock(bnum)['timestamp']
-        tss.append(ts)
-    df['timestamp'] = pd.Series(tss)
+    time.sleep(1)
+    # takes a while; add progressbar
+    print(table)
+    pbar = tqdm(total=sum(1 for row in table if 'timestamp' in row))
+    table.update(_add_timestamps(), ~Response.timestamp.exists())
 
     # convert timestamp to human readable time
-    df['date'] = df['timestamp'].apply(convert_unixtime)
+    table.update(_add_human_readable_date(), ~Response.date.exists())
 
     # convert price into float
-    df['price_float'] = df['price'].apply(lambda p: p / 1e8)
+    table.update(_add_price_float(), ~Response.price_float.exists())
 
-    return df
+    print('Done.')
 
 def approx_earliest_eth_block(rnd):
     '''
@@ -226,90 +248,54 @@ def get_all_entries(event, first_block, last_block=None, chunk_size=500, query=N
     print('Done.')
     return result
 
-def load_all_price_data(from_ts, to_ts):
-    # check if data is already saved
-    if not glob.glob('ETH-USD_prices*'):
-        return get_prices(from_ts, to_ts)
+def load_all_price_data(from_ts=None, to_ts=None):
+    '''
+    Loads price data from tinydb.
+    Also, queries for new data and saves it to tinydb.
+    '''
+
+    if not to_ts:
+        to_ts = int(time.time())
+    if not from_ts:
+        # crypto compare data goes back one week
+        from_ts = to_ts - timedelta(days=8).total_seconds()
+        from_ts = int(from_ts)
+
+    table = DB.table(ETH_USD_PRICE_TABLE)
     
-    ints, df_saved = load_saved_price_data()
-    df_saved = df_saved[(from_ts <= df_saved.time) & (df_saved.time <= to_ts)]
+    timestamps = [row['time'] for row in table]
+    timestamps = [from_ts] + timestamps + [to_ts]
+    missing_intervals = __missing_intervals(timestamps, 60)
+    
+    print('Data missing for following intervals:')
+    for mi in missing_intervals:
+        print('({}, {})'.format(*[convert_unixtime(t) for t in mi]))
 
-    # intervals `ints` do not overlap and are sorted
-    # find uncomputed timeframe between intervals
-    df = pd.DataFrame()
+    for from_ts, to_ts in missing_intervals:
+        df = get_prices(from_ts, to_ts)
+        print('{} data points gathered from CryptoCompare API'.format(df.shape[0]))
+        rows = dataframe_to_tinydb_rows(df)
+        # insert into table
+        __insert_non_duplicate(table, rows, 'time')
 
-    # gather data even further back, if possible
-    if from_ts < ints[0][0]:
-        df = get_prices(from_ts, ints[0][0])
-
-    for i in range(len(ints) - 1):
-        from_, to_ = ints[i][1] + 1, ints[i+1][0] - 1
-        df_ =  get_prices(from_, to_)
-        df = pd.concat([df, df_])
-
-    # new data
-    from_, to_ = ints[-1][1] + 1, int(time.time())
-    df_ =  get_prices(from_, to_)
-    df = pd.concat([df, df_])
-
-    # concat new data with old data
-    df = pd.concat([df_saved, df])
-    df.sort_values(by=['time'], inplace=True)
-    df.reset_index(inplace=True, drop=True)
+    df = tinydb_table_to_dataframe(table)
+    # remove potential duplicates
+    df.drop_duplicates(keep=False, inplace=True)
     return df
 
-def load_saved_price_data():
-    # example file name:
-    # ETH-USD_prices_1587033516_1587724716.csv
-    df_final = pd.DataFrame()
-    ts_ints = []
-    patt = 'ETH-USD_prices_(\d+)_(\d+).csv'
-    # file name to ts interval
-    files = {}
-    for fname in glob.glob('ETH-USD_prices_*'):
-        m = re.match(patt, fname)
-        from_ts = int(m.group(1))
-        to_ts = int(m.group(2))
-        files[fname] = (from_ts, to_ts)
-    # we don't want duplicate data;
-    # i.e. we don't want the timestamp
-    # intervals to overlap
-    ts_ints = merge_intervals(list(files.values()))
-    # for each file, only load relevant subset
-    # that aligns with merged intervals
-    start, end = zip(*ts_ints)
-    for fname, (from_ts, to_ts) in files.items():
-        i = bisect.bisect(start, from_ts) - 1
-        target_from, target_to = ts_ints[i]
-        df = pd.read_csv(fname)
-        df = df[(target_from <= df['time']) & (df['time'] <= min(target_to, to_ts))]
-        df_final = pd.concat([df_final, df])
-        if 'Unnamed: 0' in df_final.columns:
-            df_final.drop(columns=['Unnamed: 0'], inplace=True)
-            df_final.sort_values(by=['time'], inplace=True)
-            df_final.reset_index(inplace=True, drop=True)
-    print('Loaded data for the following time ranges:')
-    print(ts_ints)
-    return ts_ints, df_final
+def __missing_intervals(l, length):
+    '''
+    Return a list of tuples representing missing intervals in `l`
+    longer than `length`.
+    '''
+    l.sort()
+    ints = []
+    for i in range(len(l) - 1):
+        if l[i + 1] - l[i] > length:
+            ints.append((l[i], l[i + 1]))
+    return __merge_intervals(ints)
 
-def clean_up_price_files():
-    # clean up duplicate data
-    old_files = glob.glob('ETH-USD_prices_*')
-    if len(old_files) <= 1:
-        print('No files removed.')
-        return
-    ts_ints, df = load_saved_price_data()
-    for from_ts, to_ts in ts_ints:
-        df_ = df[(from_ts <= df.time) & (df.time <= to_ts)]
-        filename = 'ETH-USD_prices_{}_{}.csv'.format(int(from_ts), int(to_ts))
-        df_.to_csv(filename)
-        print('Created new file: ', filename)
-    #delete old files
-    for fname in old_files:
-        os.remove(fname)
-        print('Removed:', fname)
-
-def merge_intervals(arr):
+def __merge_intervals(arr):
     # a leetcode problem!
     arr.sort(key=lambda x: x[0])
     # array to hold the merged intervals
@@ -332,87 +318,114 @@ def merge_intervals(arr):
     
     return merged
 
-def get_prices(from_ts, to_ts, fsym='ETH', tsym='USD', limit=2000, save=True):
+def __insert_non_duplicate(table, rows, key):
+    '''
+    Only insert rows in `rows` whose key `key' isn't already in table.
+    Note: might take a while
+    '''
+    print('Inserting rows in table...')
 
-    def _get_prices(from_ts, to_ts, fsym, tsym, limit):
-        print('Querying dates {} to {}.'.format(
-            convert_unixtime(from_ts),
-            convert_unixtime(to_ts)
-        ))
-        # NOTE: they don't allow queries for prices older than a week
-        res = {
-            'time': [],
-            'high': [],
-            'low': [],
-            'open': [],
-            'close': [],
-            'volumefrom': [],
-            'volumeto': []
-        }
-        r = requests.get(CRYPTO_COMPARE_API_URL.format(
-            fsym=fsym, tsym=tsym, to_ts=to_ts, limit=limit), headers=CRYPTO_COMPARE_API_HEADER)
-        
-        d = json.loads(r.content.decode('utf-8'))
-        
-        if d.get('Response') == 'Error':
-            print(d['Message'])
-            return pd.DataFrame(res)
+    rows_to_insert = []
 
-        for x in d['Data']['Data']:
-            if x['time'] < from_ts:
-                break
-            for k in res.keys():
-                res[k].append(x[k])
-        else:
-            # need to keep querying to get all data in range
-            df_ = _get_prices(from_ts, min(res['time']) - 1, fsym, tsym, limit)
-            df = pd.concat([pd.DataFrame(res), df_])
-            df.reset_index(inplace=True, drop=True)
-            return df
+    count = 0
+    keys = set(row[key] for row in table)
+    for row in tqdm(rows):
+        if not row[key] in keys:
+            rows_to_insert.append(row)
+    table.insert_multiple(rows_to_insert)
+    print('{} rows inserted.'.format(len(rows_to_insert)))
+
+def get_prices(from_ts, to_ts, fsym='ETH', tsym='USD', limit=2000):
+    # NOTE: cryptocompare doesn't allow queries for prices older than a week
+    print('Querying dates {} to {}.'.format(convert_unixtime(from_ts), convert_unixtime(to_ts)))
+
+    res = {
+        'time': [],
+        'high': [],
+        'low': [],
+        'open': [],
+        'close': [],
+        'volumefrom': [],
+        'volumeto': []
+    }
+
+    r = requests.get(CRYPTO_COMPARE_API_URL.format(
+            fsym=fsym,
+            tsym=tsym,
+            to_ts=to_ts,
+            limit=limit),
+        headers=CRYPTO_COMPARE_API_HEADER)
+    
+    d = json.loads(r.content.decode('utf-8'))
+
+    if d.get('Response') == 'Error':
+        print(d['Message'])
         return pd.DataFrame(res)
-       
-    df = _get_prices(from_ts, to_ts, fsym, tsym, limit)
-    if df.empty:
-        print('No new prices gathered.')
-    if save:
-        df.to_csv('ETH-USD_prices_{}_{}.csv'.format(int(from_ts), int(to_ts)))
 
-    return df
+    for x in d['Data']['Data']:
+        if x['time'] < from_ts:
+            continue
+        for k in res.keys():
+            res[k].append(x[k])
+
+    if res['time'] and min(res['time']) > to_ts:
+        # need to keep querying to get all data in range
+        df_ = get_prices(from_ts, min(res['time']) - 1, fsym, tsym, limit)
+        df = pd.concat([pd.DataFrame(res), df_])
+        df.reset_index(inplace=True, drop=True)
+        return df
+
+    return pd.DataFrame(res)
+       
+def load_round_metric_data():
+    '''
+    For each round, we want:
+        length of round
+        standard deviation of reporting times
+        price volatility (between start and end of round)
+        how much does this explain the variability in the responses?
+    '''
+    web3, contract = connect()
+    
+    latest_round = contract.functions.latestRound().call()
+
+    # get start and end times of rounds
+    first_block = approx_earliest_eth_block(last_round + 1)['number']
+    start = get_all_entries(
+        contract.events.NewRound(),
+        first_block,
+        query=(('args', 'roundId'), ('blockNumber',)),
+        chunk_size=2000
+    )
+
+    print('Converting block numbers to timestamps...')
+    start['ts_start'] = []
+    end = {'roundId':[], 'ts_end': []}
+    for i,rnd in enumerate(tqdm(start['roundId'])):
+        start['ts_start'].append(web3.eth.getBlock(start['blockNumber'][i])['timestamp'])
+        end['roundId'].append(rnd)
+        end['ts_end'].append(contract.functions.getTimestamp(rnd).call())
+
+    # change column names
+    df_start = pd.DataFrame(start).set_index('roundId')
+    df_end = pd.DataFrame(end).set_index('roundId')
+    df_ts = df_start.join(df_end)
+
+    if files:
+        df_ts = pd.concat([df_old, df_ts])
+
+    if save:
+        latest = latest_block = web3.eth.getBlock('latest')['number']
+        df_ts.to_csv('start_end_timestamps_round{}.csv'.format(latest))
+
+    return df_ts
 
 
 if __name__ == "__main__":
     # testing
-    '''
-    web3, contract = connect()
-    res = approx_earliest_eth_block(1)
-    #print(res['number'])
-    start = approx_earliest_eth_block(200)['number']
-    end = approx_earliest_eth_block(202)['number']
-    res = get_all_entries(
-        contract.events.ResponseReceived(),
-        start,
-        last_block=end,
-        query=(
-            ('args', 'response'),
-            ('args', 'answerId'),
-            ('args', 'sender'),
-            ('blockNumber',)
-        ),
-        chunk_size=500
-    )
-    #print(res)
-    #res = load_all_price_response_data()
-    #print(res)
-    
-    ts = int(time.time())
-    from_ts = ts - 60*60*24*8
-    to_ts = ts
-
-    df = get_prices(from_ts, to_ts)
-    to_ts = int(time.time())
-    # seconds in minute, minutes in hour, hours in day, num days
-    from_ts = to_ts - 60*60*24*14
-    df = load_all_price_data(from_ts, to_ts)
+    df = load_all_price_response_data()
     print(df)
-    '''
-    clean_up_price_files()
+    #to_ts = int(time.time())
+    #from_ts = to_ts - 60*60*24*8
+    #get_prices(from_ts, to_ts)
+    #print(load_all_price_data())
