@@ -2,6 +2,7 @@ import bisect
 import glob
 import json
 import math
+import numpy as np
 import os
 import pandas as pd
 import re
@@ -28,49 +29,54 @@ convert_unixtime = lambda ts: datetime.utcfromtimestamp(ts).strftime('%Y-%m-%d %
 filename = lambda rnd, other_info: 'eth_usd_price_round_' + '{}_{}.csv'.format(rnd, other_info)
 FILE_PREFIX = 'eth_usd_price_round'
 
-### LOAD TINY DATABASE ###
-
-DB = TinyDB('db.json')
-
-# database tables
-ORACLE_RESPONSE_TABLE = 'oracle_responses'
-ETH_USD_PRICE_TABLE = 'eth-usd-prices'
+ORACLE_RESPONSE_FILE = 'oracle_responses.csv'
+ETH_USD_PRICES_FILE = 'eth-usd_prices.csv'
+ROUND_STATS_FILE = 'price_contract_round_stats.csv'
 
 def connect():
     web3 = Web3(Web3.WebsocketProvider(INFURA_PROVIDER))
     contract = web3.eth.contract(ETH_USD_PRICE_CONTRACT_ADDR, abi=CHAINLINK_ABI)
     return web3, contract
 
-def tinydb_table_to_dataframe(table):
-    d = {}
-    for i,row in enumerate(table):
-        if i == 0:
-            d = {k: [] for k in row.keys()}
-        for k in d.keys():
-            d[k].append(row[k])
-    return pd.DataFrame(d)
-
-def dataframe_to_tinydb_rows(df):
-    d = df.to_dict()
-    return [{k: d[k][i] for k in d.keys()} for i in range(df.shape[0])]
-
-def load_all_price_response_data():
+def load_oracle_responses(save=True):
     # assumes table 'oracle_responses' in `DB` in not empty
     web3, contract = connect()
-    
-    table = DB.table(ORACLE_RESPONSE_TABLE)
-   
+
+    try:
+        df = pd.read_csv(ORACLE_RESPONSE_FILE, index_col=0)
+        if "Unnamed: 0" in df.columns:
+            df.drop(["Unnamed: 0"], inplace=True)
+        if "Unnamed: 0.1" in df.columns:
+            df.drop(["Unnamed: 0.1"], inplace=True, axis=1)
+    except IOError:
+        df = pd.DataFrame()
+            
     # check if data is already up-to-date
     latest_round = contract.functions.latestRound().call()
     print('Latest round: {}'.format(latest_round))
-  
-    last_round = max(row['answer_id'] for row in table)
-    print('Last saved round: {}.'.format(last_round))
-    if last_round == latest_round:
-        # return dataframe
-        return tinydb_table_to_dataframe(table)
+ 
+    if not df.empty:
+        last_round = max(df['answer_id'])
+        print('Last saved round: {}.'.format(last_round))
+    else:
+        last_round = 0
 
+    print(last_round)
+    if last_round == latest_round:
+        return df
+
+    ts = contract.functions.getTimestamp(last_round + 1).call()
+    if ts == 0:
+        # current round not over
+        return df
+
+    ts = contract.functions.getTimestamp(last_round + 1).call()
+    if ts == 0:
+        # round not over
+        return df
+    
     first_block = approx_earliest_eth_block(last_round + 1)['number']
+    
     entries = get_all_entries(
         contract.events.ResponseReceived(),
         first_block,
@@ -83,61 +89,61 @@ def load_all_price_response_data():
         chunk_size=500
     )
     
-    df = pd.DataFrame(entries)
-    df.rename(columns={
-        'response': 'price',
-        'answerId': 'answer_id',
-        'sender': 'oracle'}
+    df_new = pd.DataFrame(entries)
+    df_new.rename(
+        columns={
+            'response': 'price',
+            'answerId': 'answer_id',
+            'sender': 'oracle'},
+        inplace=True
     )
-    rows = dataframe_to_tinydb_rows(df)
-    print('Inserting new rows...')
-    table.insert_multiple(rows)
 
-    _augment_price_response_data(table)
+    __augment_price_response_data(df_new)
 
-    rows = dataframe_to_tinydb_rows(df)
-    table.insert_multiple(rows)
+    # avoid potential duplicates
+    df_new = df_new[df_new['answer_id'] > last_round]
 
-    return tinydb_table_to_dataframe(table)
+    df_ = pd.concat([df, df_new])
+    df_.sort_values(by='answer_id', inplace=True)
+    df_.reset_index(inplace=True, drop=True)
+    
+    if save:
+        # rewrite file
+        # TODO: is there a way to do this safetly,
+        # i.e. atomically?
+        df_.to_csv(ORACLE_RESPONSE_FILE, index=False)
+    
+    return df_
 
-def _augment_price_response_data(table):
+def __augment_price_response_data(df):
 
     web3, contract = connect()
 
     print('Augmenting entries...')
 
-    def _add_timestamps():
-        def transform(row):
-            pbar.update(1)
-            ts =  web3.eth.getBlock(row['blockNumber'])['timestamp']
-            row['timestamp'] = ts
-        return transform
+    def add_timestamp(row):
+        pbar.update()
+        ts = web3.eth.getBlock(row['blockNumber'])['timestamp'] 
+        return ts
 
-    def _add_human_readable_date():
-        def transform(row):
-            row['date'] = convert_unixtime(row['timestamp'])
-        return transform
+    def add_date(row):
+        return convert_unixtime(int(row['timestamp']))
 
-    def _add_price_float():
-        def transform(row):
-            row['price_float'] = row['price'] / 1e8
-        return transform
-
-    Response = Query()
+    def add_price_float(row):
+        return int(row['price']) / 1e8
 
     print('Adding timestamps...')
     time.sleep(1)
     # takes a while; add progressbar
-    print(table)
-    pbar = tqdm(total=sum(1 for row in table if 'timestamp' in row))
-    table.update(_add_timestamps(), ~Response.timestamp.exists())
+    pbar = tqdm(total=df.shape[0])
+    df['timestamp'] = df.apply(lambda row: add_timestamp(row), axis=1)
 
     # convert timestamp to human readable time
-    table.update(_add_human_readable_date(), ~Response.date.exists())
+    df['date'] = df.apply(lambda row: add_date(row), axis=1)
 
     # convert price into float
-    table.update(_add_price_float(), ~Response.price_float.exists())
-
+    df['price_float'] = df.apply(lambda row: add_price_float(row), axis=1)
+    
     print('Done.')
 
 def approx_earliest_eth_block(rnd):
@@ -145,6 +151,7 @@ def approx_earliest_eth_block(rnd):
     Return approximately the first Ethereum block we care about,
     namely one that was mined not long *before* round `rnd` in our contract.
     '''
+    #TODO: delete prints
     web3, contract = connect()
     
     ts_response = contract.functions.getTimestamp(rnd).call()
@@ -248,7 +255,7 @@ def get_all_entries(event, first_block, last_block=None, chunk_size=500, query=N
     print('Done.')
     return result
 
-def load_all_price_data(from_ts=None, to_ts=None):
+def load_all_price_data(from_ts=None, to_ts=None, save=True):
     '''
     Loads price data from tinydb.
     Also, queries for new data and saves it to tinydb.
@@ -261,26 +268,37 @@ def load_all_price_data(from_ts=None, to_ts=None):
         from_ts = to_ts - timedelta(days=8).total_seconds()
         from_ts = int(from_ts)
 
-    table = DB.table(ETH_USD_PRICE_TABLE)
-    
-    timestamps = [row['time'] for row in table]
-    timestamps = [from_ts] + timestamps + [to_ts]
-    missing_intervals = __missing_intervals(timestamps, 60)
+    try:
+        df = pd.read_csv(ETH_USD_PRICES_FILE, index_col=0)
+        timestamps = [from_ts] + [ts for ts in df.index if from_ts < ts and ts < to_ts] + [to_ts]
+        print(timestamps)
+        missing_intervals = __missing_intervals(timestamps, 60)
+    except IOError:
+        df = pd.DataFrame()
+        missing_intervals = [(from_ts, to_ts)]
     
     print('Data missing for following intervals:')
     for mi in missing_intervals:
         print('({}, {})'.format(*[convert_unixtime(t) for t in mi]))
 
     for from_ts, to_ts in missing_intervals:
-        df = get_prices(from_ts, to_ts)
-        print('{} data points gathered from CryptoCompare API'.format(df.shape[0]))
-        rows = dataframe_to_tinydb_rows(df)
-        # insert into table
-        __insert_non_duplicate(table, rows, 'time')
+        df_ = get_prices(from_ts, to_ts)
+        print('{} data points gathered from CryptoCompare API'.format(df_.shape[0]))
+        df = pd.concat([df, df_])
+        print(1, df.shape)
+        df.reset_index(inplace=True, drop=True)
+        print(2, df.shape)
 
-    df = tinydb_table_to_dataframe(table)
     # remove potential duplicates
-    df.drop_duplicates(keep=False, inplace=True)
+    df.drop_duplicates(subset=['time'], keep='first', inplace=True)
+    print(3, df.shape)
+
+    if save:
+        # rewrite file
+        # TODO: is there a way to do this safetly,
+        # i.e. atomically?
+        df.to_csv(ETH_USD_PRICES_FILE, index=False)
+    
     return df
 
 def __missing_intervals(l, length):
@@ -318,37 +336,13 @@ def __merge_intervals(arr):
     
     return merged
 
-def __insert_non_duplicate(table, rows, key):
-    '''
-    Only insert rows in `rows` whose key `key' isn't already in table.
-    Note: might take a while
-    '''
-    print('Inserting rows in table...')
-
-    rows_to_insert = []
-
-    count = 0
-    keys = set(row[key] for row in table)
-    for row in tqdm(rows):
-        if not row[key] in keys:
-            rows_to_insert.append(row)
-    table.insert_multiple(rows_to_insert)
-    print('{} rows inserted.'.format(len(rows_to_insert)))
-
 def get_prices(from_ts, to_ts, fsym='ETH', tsym='USD', limit=2000):
     # NOTE: cryptocompare doesn't allow queries for prices older than a week
     print('Querying dates {} to {}.'.format(convert_unixtime(from_ts), convert_unixtime(to_ts)))
 
-    res = {
-        'time': [],
-        'high': [],
-        'low': [],
-        'open': [],
-        'close': [],
-        'volumefrom': [],
-        'volumeto': []
-    }
-
+    keys = ['time', 'high', 'low', 'open', 'close', 'volumefrom', 'volumeto']
+    res = {k:[] for k in keys}
+    
     r = requests.get(CRYPTO_COMPARE_API_URL.format(
             fsym=fsym,
             tsym=tsym,
@@ -368,16 +362,24 @@ def get_prices(from_ts, to_ts, fsym='ETH', tsym='USD', limit=2000):
         for k in res.keys():
             res[k].append(x[k])
 
-    if res['time'] and min(res['time']) > to_ts:
+    #print('here')
+    #print(min(res['time']))
+    #print(convert_unixtime(min(res['time'])))
+    if res['time'] and min(res['time']) > from_ts:
         # need to keep querying to get all data in range
         df_ = get_prices(from_ts, min(res['time']) - 1, fsym, tsym, limit)
         df = pd.concat([pd.DataFrame(res), df_])
         df.reset_index(inplace=True, drop=True)
         return df
 
-    return pd.DataFrame(res)
-       
-def load_round_metric_data():
+    df = pd.DataFrame(res)
+    # ensure column order
+    df = df.reindex(columns=keys)
+    print('HERE')
+    print(df)
+    return df
+
+def load_round_metrics(price_df, response_df, save=True):
     '''
     For each round, we want:
         length of round
@@ -386,11 +388,36 @@ def load_round_metric_data():
         how much does this explain the variability in the responses?
     '''
     web3, contract = connect()
-    
+
+    try:
+        df = pd.read_csv(ROUND_STATS_FILE, index_col=0)
+        if "Unnamed: 0" in df.columns:
+            df.drop(["Unnamed: 0"], inplace=True)
+        if "Unnamed: 0.1" in df.columns:
+            df.drop(["Unnamed: 0.1"], inplace=True, axis=1)
+        last_round = max(df.index)
+    except IOError:
+        df = pd.DataFrame()
+        last_round = 0
+
     latest_round = contract.functions.latestRound().call()
 
-    # get start and end times of rounds
+    if latest_round == last_round:
+        return df
+    
+    ts = contract.functions.getTimestamp(last_round + 1).call()
+    if ts == 0:
+        # current round not over
+        return df
+
+    # otherwise, update data
+    
+    # - get start times of rounds
+    # - we let the timestamp of the block with `NewRound` event be the start time
+    
+    print('Getting start times of rounds...')
     first_block = approx_earliest_eth_block(last_round + 1)['number']
+    
     start = get_all_entries(
         contract.events.NewRound(),
         first_block,
@@ -399,33 +426,94 @@ def load_round_metric_data():
     )
 
     print('Converting block numbers to timestamps...')
+    
+    # end times of rounds are computed by calling event `getTimestamp` 
     start['ts_start'] = []
-    end = {'roundId':[], 'ts_end': []}
+    end = {'round_id':[], 'ts_end': []}
+
     for i,rnd in enumerate(tqdm(start['roundId'])):
         start['ts_start'].append(web3.eth.getBlock(start['blockNumber'][i])['timestamp'])
-        end['roundId'].append(rnd)
+        end['round_id'].append(rnd)
         end['ts_end'].append(contract.functions.getTimestamp(rnd).call())
 
     # change column names
-    df_start = pd.DataFrame(start).set_index('roundId')
-    df_end = pd.DataFrame(end).set_index('roundId')
+    df_start = pd.DataFrame(start)
+    df_end = pd.DataFrame(end)
+    df_start.rename(
+        columns={
+            "roundId": "round_id",
+            "blockNumber": "block_number"
+        },
+        inplace=True
+    )
+    df_start.set_index('round_id', inplace=True)
+    df_end.set_index('round_id', inplace=True)
     df_ts = df_start.join(df_end)
 
-    if files:
-        df_ts = pd.concat([df_old, df_ts])
+    # concat with previous data
+    df_ts = pd.concat([df, df_ts])
+    df_ts.sort_values(by=['round_id'], inplace=True)
+
+    __augment_round_data(df_ts, price_df, response_df)
 
     if save:
-        latest = latest_block = web3.eth.getBlock('latest')['number']
-        df_ts.to_csv('start_end_timestamps_round{}.csv'.format(latest))
+        df_ts.to_csv(ROUND_STATS_FILE, index=False)
 
     return df_ts
 
+def __augment_round_data(df_ts, price_df, response_df):
+    '''
+    For each round, we want:
+        - length of round
+        - standard deviation of reporting times
+        - price volatility (between start and end of round)
+        - how much does this explain the variability in the responses?
+
+    All in-place, returns None.
+    '''
+
+    web3, contract = connect()
+
+    print('Augmenting round data...')
+
+    def add_price_volatility(row):
+        rnd = row.name # round id
+        start = df_ts.loc[rnd]['ts_start']
+        end = df_ts.loc[rnd]['ts_end']
+        i = price_df['time'].sort_values().searchsorted(start, side='right')
+        j = price_df['time'].sort_values().searchsorted(end, side='left')
+        if start <= price_df.iloc[i]['time'] and price_df.iloc[j-1]['time'] <= end:
+            df = price_df.iloc[i:j+1]
+            # compute std of prices in this time range 
+            df.loc[:,'avg_price'] = df.apply(lambda row: approx_avg_price(row), axis=1)
+            vol = df['avg_price'].values.std()
+            return vol
+        else:
+            return np.nan
+
+    def approx_avg_price(row):
+        keys = ['high', 'low', 'open', 'close']
+        avg = sum(row[k] for k in keys) / len(keys)
+        return avg
+
+    print('Computing length of rounds...')
+    df_ts['round_length'] = df_ts['ts_end'] - df_ts['ts_start']
+    
+    print('Computing standard deviation of response times...')
+    # if oracle reponded more than once, pick last response
+    df_ts['response_ts_std'] = response_df.\
+        sort_values(by=['timestamp']).\
+        drop_duplicates(keep='last').\
+        groupby('answer_id').agg(np.std)['timestamp'] 
+
+    print('Computing price volatility...')
+    # make sure sorted
+    df_ts['volatility'] = df_ts.apply(lambda row: add_price_volatility(row), axis=1)
 
 if __name__ == "__main__":
     # testing
-    df = load_all_price_response_data()
+    oracle_df = load_oracle_responses()
+    price_df = load_all_price_data(save=False)
+    df = load_round_metrics(price_df, oracle_df)
     print(df)
-    #to_ts = int(time.time())
-    #from_ts = to_ts - 60*60*24*8
-    #get_prices(from_ts, to_ts)
-    #print(load_all_price_data())
+    #print(round_df)
