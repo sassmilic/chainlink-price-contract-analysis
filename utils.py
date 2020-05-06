@@ -10,6 +10,7 @@ import re
 import requests
 import sys
 import time
+import warnings
 from collections import defaultdict
 from datetime import datetime, timedelta
 from tinydb import TinyDB, Query, where
@@ -25,9 +26,19 @@ from configs import (
     INFURA_PROVIDER,
     ETH_USD_PRICE_CONTRACT_ADDR,
     CHAINLINK_ABI,
+    CRYPTO_COMPARE_API_KEY,
     CRYPTO_COMPARE_API_URL,
     CRYPTO_COMPARE_API_HEADER
 )
+
+if not INFURA_URL:
+    warnings.warn("Infura URL is missing. Go here to sign up for an account: https://infura.io/")
+
+if not INFURA_PROVIDER:
+    warnings.warn("Infura URL is missing. Go here to sign up for an account: https://infura.io/")
+
+if not CRYPTO_COMPARE_API_KEY:
+    warnings.warn("CryptoCompare API key is missing. Go here to set up an account: https://min-api.cryptocompare.com/pricing")
 
 convert_unixtime = lambda ts: datetime.utcfromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
 filename = lambda rnd, other_info: 'eth_usd_price_round_' + '{}_{}.csv'.format(rnd, other_info)
