@@ -535,8 +535,9 @@ def __augment_round_data(df_ts, price_df, response_df):
     #df_ts.sort_index(inplace=True)
     df_ts['volatility'] = df_ts.apply(lambda row: add_price_volatility(row), axis=1)
 
-def generate_random_gaussians(sample_size, ndists):
-    print('Drawing {} random samples (n={}) from Gaussian'.format(ndists, sample_size))
+def generate_random_gaussians(sample_size, ndists, verbose=True):
+    if verbose:
+        print('Drawing {} random samples (n={}) from Gaussian'.format(ndists, sample_size))
     d = defaultdict(list)
     for i in range(ndists):
         # we even seed with a quantum random number generator!
@@ -549,10 +550,12 @@ def generate_random_gaussians(sample_size, ndists):
     return pd.DataFrame(d)
 
 if __name__ == "__main__":
-    # testing
-    #oracle_df = load_oracle_responses()
-    price_df = load_price_data()
-    print(price_df)
+    ###
+    ### testing
+    ###
+    oracle_df = load_oracle_responses()
+    #price_df = load_price_data()
+    #print(price_df)
     #df = load_round_metrics(price_df, oracle_df)
-    print(df)
+    print(oracle_df)
     #print(round_df)
