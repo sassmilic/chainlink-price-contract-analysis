@@ -285,11 +285,9 @@ def load_price_data(from_ts=None, to_ts=None, save=True):
         from_ts = int(from_ts)
 
     try:
-        df = pd.read_csv(ETH_USD_PRICES_FILE, index_col=0)
+        df = pd.read_csv(ETH_USD_PRICES_FILE)#, index_col=0)
         timestamps = [from_ts] + [ts for ts in df.index if from_ts < ts and ts < to_ts] + [to_ts]
         missing_intervals = __missing_intervals(timestamps, 60)
-        #df = pd.read_csv('eth-usd_prices.csv~', index_col=0)
-        #return df
     except IOError:
         df = pd.DataFrame()
         missing_intervals = [(from_ts, to_ts)]
@@ -302,15 +300,16 @@ def load_price_data(from_ts=None, to_ts=None, save=True):
         df_ = get_prices(from_ts, to_ts)
         print('{} data points gathered from CryptoCompare API'.format(df_.shape[0]))
         df = pd.concat([df, df_])
-
-    # remove potential duplicates
-    #df = df.loc[~df.index.duplicated(keep='first')]
+    
+    # just in case, sort and drop dupes
+    df.sort_values(by=['time'], inplace=True)
+    df.drop_duplicates(subset=['time'], inplace=True)
 
     if save:
         # rewrite file
         # TODO: is there a way to do this safetly,
         # i.e. atomically?
-        df.to_csv(ETH_USD_PRICES_FILE)
+        df.to_csv(ETH_USD_PRICES_FILE, index=False)
 
     return df
 
@@ -363,11 +362,7 @@ def get_prices(from_ts, to_ts, fsym='ETH', tsym='USD', limit=2000):
             limit=limit),
         headers=CRYPTO_COMPARE_API_HEADER)
 
-    print(CRYPTO_COMPARE_API_URL.format(fsym=fsym, tsym=tsym, to_ts=to_ts, limit=limit), CRYPTO_COMPARE_API_HEADER)
-
     d = json.loads(r.content.decode('utf-8'))
-
-    print(d)
 
     if d.get('Response') == 'Error':
         print(d['Message'])
@@ -383,12 +378,13 @@ def get_prices(from_ts, to_ts, fsym='ETH', tsym='USD', limit=2000):
         # need to keep querying to get all data in range
         df_ = get_prices(from_ts, min(res['time']) - 1, fsym, tsym, limit)
         df = pd.concat([pd.DataFrame(res), df_])
-        df.set_index('time', inplace=True)
+        #df.set_index('time', inplace=True)
         return df
 
     df = pd.DataFrame(res)
     # ensure column order
-    df.set_index('time', inplace=True)
+    #df.set_index('time', inplace=True)
+    print('HERE')
     return df
 
 def load_round_metrics(price_df, response_df, save=True, pbar=True):
@@ -553,9 +549,9 @@ if __name__ == "__main__":
     ###
     ### testing
     ###
-    oracle_df = load_oracle_responses()
-    #price_df = load_price_data()
+    #oracle_df = load_oracle_responses()
+    price_df = load_price_data()
     #print(price_df)
     #df = load_round_metrics(price_df, oracle_df)
-    print(oracle_df)
+    print(price_df)
     #print(round_df)
