@@ -1,5 +1,3 @@
 # chainlink-price-contract-analysis
 
-### TODO
-* Update Fligner-Killeen test: run test on multiple subsets of rounds instead of entire set of rounds
-  * Why: one "bad" round can lead to a significant p-value. We are more interested in whether or not consecutive (for example) rounds have significantly different variances.
+Looks like there's an answer to the question I raised in the introduction re: unique attack vectors on real-valued consensus systems. There exists a small, recent body of research called **STEALTH ATTACKS ON CYBER-PHYSICAL SYSTEMS**.
